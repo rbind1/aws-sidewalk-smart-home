@@ -1,0 +1,112 @@
+/*
+ * Copyright (c) 2024 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+ /{
+	aliases {
+		state-notifier-connected = &led0;
+		state-notifier-time-sync = &led1;
+		state-notifier-registered = &led2;
+		state-notifier-working = &led3;
+	};
+};
+
+&cpuapp_rram {
+	reg = <0x0 DT_SIZE_K(1524)>;
+};
+
+&cpuapp_sram {
+	reg = <0x20000000 DT_SIZE_K(256)>;
+	ranges = <0x0 0x20000000  0x40000>;
+};
+
+&adc {
+	status = "disabled";
+};
+
+&uart21 {
+	status = "disabled";
+};
+
+&pwm20 {
+	status = "disabled";
+};
+
+&i2c20 {
+	status = "disabled";
+};
+
+&spi20 {
+	status = "disabled";
+};
+
+&spi22 {
+	status = "disabled";
+};
+
+/*
+ * BME280 on I2C.
+ *
+ * Wiring:
+ *   BME280 VIN/VCC -> DK VDDIO
+ *   BME280 GND     -> DK GND
+ *   BME280 SDA     -> DK P1.12
+ *   BME280 SCL     -> DK P1.11
+ *   BME280 CSB     -> DK VDDIO
+ *   BME280 SDO     -> DK GND
+ *
+ * SDO = GND selects I2C address 0x76.
+ * If SDO is connected to VDDIO instead, change reg = <0x77>.
+ */
+&pinctrl {
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 12)>,
+				<NRF_PSEL(TWIM_SCL, 1, 11)>;
+			bias-pull-up;
+		};
+	};
+
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 12)>,
+				<NRF_PSEL(TWIM_SCL, 1, 11)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c21 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+
+	bme280: bme280@76 {
+		compatible = "bosch,bme280";
+		reg = <0x76>;
+	};
+};
+
+// TODO: re-enable HWFC once it's fixed
+&uart20 {
+	/delete-property/ hw-flow-control;
+};
+
+
+// Change IRQ ids to handle button interrupts.
+
+// The default values for nRF54L15 are 219 and 269,
+// but with TF-M they are reserved for the secure domain
+// (218 and 268 are reserved for the non-secure domain).
+&gpiote20 {
+	interrupts = <218 NRF_DEFAULT_IRQ_PRIORITY>;
+};
+
+&gpiote30 {
+	interrupts = <268 NRF_DEFAULT_IRQ_PRIORITY>;
+};
