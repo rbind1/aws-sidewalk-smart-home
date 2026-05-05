@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sidewalk Smart Home — nRF54L15 DK Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #f8f8f6;
+    --surface: #ffffff;
+    --border:  rgba(0,0,0,0.10);
+    --text:    #1a1a18;
+    --muted:   #6b6b66;
+    --blue:    #185FA5;
+    --green:   #3B6D11;
+    --amber:   #854F0B;
+    --red:     #A32D2D;
+    --teal:    #0F6E56;
+    --radius:  12px;
+  }
+
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px 20px;
+  }
+
+  header {
+    max-width: 1100px;
+    margin: 0 auto 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  header p {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #ccc;
+    display: inline-block;
+    margin-right: 6px;
+  }
+  .status-dot.live   { background: #3B6D11; }
+  .status-dot.stale  { background: #BA7517; }
+  .status-dot.offline{ background: #A32D2D; }
+
+  .device-bar {
+    max-width: 1100px;
+    margin: 0 auto 20px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+
+  .device-bar label {
+    font-size: 12px;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .device-bar input, .device-bar select {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+  }
+
+  .device-bar input { width: 280px; }
+
+  button {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    background: var(--surface);
+    color: var(--text);
+    transition: background 0.15s;
+  }
+  button:hover { background: #f0f0ee; }
+  button:active { transform: scale(0.98); }
+
+  .btn-primary {
+    background: var(--blue);
+    color: #fff;
+    border-color: var(--blue);
+  }
+  .btn-primary:hover { background: #0C447C; }
+
+  .main {
+    max-width: 1100px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+  }
+
+  .card-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+
+  .card-value {
+    font-size: 36px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .card-unit {
+    font-size: 16px;
+    font-weight: 400;
+    color: var(--muted);
+    margin-left: 2px;
+  }
+
+  .card-sub {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+
+  .motion-yes { color: var(--amber); }
+  .motion-no  { color: var(--muted); }
+
+  .charts {
+    max-width: 1100px;
+    margin: 0 auto 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+
+  @media (max-width: 700px) {
+    .charts { grid-template-columns: 1fr; }
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+  }
+
+  .chart-card h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+
+  .chart-wrap { position: relative; height: 200px; }
+
+  .controls {
+    max-width: 1100px;
+    margin: 0 auto 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+
+  .controls h2 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 14px;
+  }
+
+  .control-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .btn-led-on    { background: #EAF3DE; color: #3B6D11; border-color: #97C459; }
+  .btn-led-off   { background: #FCEBEB; color: #A32D2D; border-color: #F09595; }
+  .btn-led-tog   { background: #E6F1FB; color: #185FA5; border-color: #85B7EB; }
+
+  .btn-led-on:hover  { background: #C0DD97; }
+  .btn-led-off:hover { background: #F7C1C1; }
+  .btn-led-tog:hover { background: #B5D4F4; }
+
+  .log {
+    max-width: 1100px;
+    margin: 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+  }
+
+  .log h2 { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+
+  #log-list {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--muted);
+    max-height: 160px;
+    overflow-y: auto;
+    line-height: 1.7;
+  }
+
+  .log-ok   { color: var(--green); }
+  .log-err  { color: var(--red);   }
+  .log-info { color: var(--blue);  }
+
+  .refresh-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+
+  #last-refresh {
+    font-size: 12px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Sidewalk Smart Home Dashboard</h1>
+    <p>nRF54L15 DK · Amazon Sidewalk · AWS IoT Core</p>
+  </div>
+  <div style="font-size:13px;color:var(--muted)">
+    <span class="status-dot" id="conn-dot"></span>
+    <span id="conn-label">Connecting...</span>
+  </div>
+</header>
+
+<!-- Device selector -->
+<div class="device-bar">
+  <div>
+    <label>Wireless Device ID</label>
+    <input id="device-id" type="text" placeholder="e.g. abc-123-def-456"
+           value="test-device-001">
+  </div>
+  <div>
+    <label>History</label>
+    <select id="limit-select">
+      <option value="20">Last 20</option>
+      <option value="50" selected>Last 50</option>
+      <option value="100">Last 100</option>
+    </select>
+  </div>
+  <div>
+    <label>&nbsp;</label>
+    <button class="btn-primary" onclick="refresh()">Refresh</button>
+  </div>
+  <div id="last-refresh" style="align-self:flex-end;padding-bottom:6px"></div>
+</div>
+
+<!-- Metric cards -->
+<div class="main">
+  <div class="card">
+    <div class="card-label">Temperature</div>
+    <div class="card-value" id="val-temp">—<span class="card-unit">°C</span></div>
+    <div class="card-sub" id="sub-temp">Waiting for data...</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Humidity</div>
+    <div class="card-value" id="val-hum">—<span class="card-unit">%</span></div>
+    <div class="card-sub" id="sub-hum"></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Motion</div>
+    <div class="card-value" id="val-motion" style="font-size:24px">—</div>
+    <div class="card-sub" id="sub-motion"></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Last uplink</div>
+    <div class="card-value" id="val-seq" style="font-size:28px">—</div>
+    <div class="card-sub" id="sub-time">seq #—</div>
+  </div>
+</div>
+
+<!-- Charts -->
+<div class="charts">
+  <div class="chart-card">
+    <h3>Temperature history (°C)</h3>
+    <div class="chart-wrap">
+      <canvas id="chart-temp"></canvas>
+    </div>
+  </div>
+  <div class="chart-card">
+    <h3>Humidity history (%RH)</h3>
+    <div class="chart-wrap">
+      <canvas id="chart-hum"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- LED Controls -->
+<div class="controls">
+  <h2>Device controls — downlink commands</h2>
+  <div class="control-row">
+    <button class="btn-led-on"  onclick="sendDownlink('led_on')">LED / relay ON</button>
+    <button class="btn-led-off" onclick="sendDownlink('led_off')">LED / relay OFF</button>
+    <button class="btn-led-tog" onclick="sendDownlink('led_toggle')">Toggle</button>
+    <span style="font-size:12px;color:var(--muted);margin-left:4px">
+      Commands reach the DK via IoT Wireless → Echo → BLE (~5–10 s latency)
+    </span>
+  </div>
+</div>
+
+<!-- Activity log -->
+<div class="log">
+  <h2>Activity log</h2>
+  <div id="log-list"></div>
+</div>
+
+<script>
+//  Config 
+// https://6ski37ftql.execute-api.us-east-1.amazonaws.com/prod is replaced by deploy.sh with the actual API Gateway URL.
+// If running locally for development, set this manually:
+const API = 'https://6ski37ftql.execute-api.us-east-1.amazonaws.com/prod';
+
+//  State 
+let tempChart, humChart;
+let autoRefreshTimer = null;
+
+//  Logging 
+function log(msg, type = 'info') {
+  const el   = document.getElementById('log-list');
+  const time = new Date().toLocaleTimeString();
+  const div  = document.createElement('div');
+  div.className = `log-${type}`;
+  div.textContent = `[${time}] ${msg}`;
+  el.prepend(div);
+  // Keep last 50 entries
+  while (el.children.length > 50) el.removeChild(el.lastChild);
+}
+
+//  Charts 
+function makeChart(id, label, color) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label,
+        data: [],
+        borderColor: color,
+        backgroundColor: color + '18',
+        borderWidth: 1.5,
+        pointRadius: 2,
+        tension: 0.3,
+        fill: true,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          ticks: { maxTicksLimit: 8, font: { size: 11 } },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        },
+        y: {
+          ticks: { font: { size: 11 } },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
+}
+
+function updateCharts(readings) {
+  const labels = readings.map(r => {
+    const d = new Date(parseInt(r.timestamp) * 1000);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  });
+  const temps = readings.map(r => parseFloat(r.temperature_c));
+  const hums  = readings.map(r => parseFloat(r.humidity_pct));
+
+  tempChart.data.labels            = labels;
+  tempChart.data.datasets[0].data  = temps;
+  humChart.data.labels             = labels;
+  humChart.data.datasets[0].data   = hums;
+  tempChart.update('none');
+  humChart.update('none');
+}
+
+//  Data fetching 
+async function refresh() {
+  const deviceId = document.getElementById('device-id').value.trim();
+  const limit    = document.getElementById('limit-select').value;
+
+  if (!deviceId) { log('Enter a device ID first', 'err'); return; }
+
+  setConnection('connecting');
+  log(`Fetching ${limit} readings for device ${deviceId}...`);
+
+  try {
+    const [latestResp, readingsResp] = await Promise.all([
+      fetch(`${API}/latest?device_id=${encodeURIComponent(deviceId)}`),
+      fetch(`${API}/readings?device_id=${encodeURIComponent(deviceId)}&limit=${limit}`)
+    ]);
+
+    if (!latestResp.ok || !readingsResp.ok) throw new Error('API error');
+
+    const latest   = await latestResp.json();
+    const readings = await readingsResp.json();
+
+    updateLatestCards(latest);
+    if (Array.isArray(readings) && readings.length > 0) {
+      updateCharts(readings);
+      log(`Loaded ${readings.length} readings`, 'ok');
+      setConnection('live');
+    } else {
+      log('No readings found for this device ID', 'err');
+      setConnection('offline');
+    }
+
+    document.getElementById('last-refresh').textContent =
+      `Last refreshed: ${new Date().toLocaleTimeString()}`;
+
+  } catch (err) {
+    log(`Fetch error: ${err.message}`, 'err');
+    setConnection('offline');
+  }
+}
+
+function updateLatestCards(item) {
+  if (!item || !item.timestamp) return;
+
+  const temp   = parseFloat(item.temperature_c);
+  const hum    = parseFloat(item.humidity_pct);
+  const motion = item.motion;
+  const seq    = item.seq;
+  const age    = Math.round((Date.now() / 1000) - parseInt(item.timestamp));
+
+  document.getElementById('val-temp').innerHTML =
+    `${temp}<span class="card-unit">°C</span>`;
+  document.getElementById('sub-temp').textContent =
+    temp > 28 ? 'Above comfort zone' : temp < 18 ? 'Below comfort zone' : 'Normal range';
+
+  document.getElementById('val-hum').innerHTML =
+    `${hum}<span class="card-unit">%</span>`;
+  document.getElementById('sub-hum').textContent =
+    hum > 70 ? 'High — consider ventilating' : hum < 30 ? 'Low — dry air' : 'Comfortable';
+
+  document.getElementById('val-motion').textContent = motion ? 'Detected' : 'None';
+  document.getElementById('val-motion').className =
+    'card-value ' + (motion ? 'motion-yes' : 'motion-no');
+  document.getElementById('sub-motion').textContent =
+    motion ? 'Motion flag set in last uplink' : 'No motion in last uplink';
+
+  document.getElementById('val-seq').textContent = seq ?? '—';
+  document.getElementById('sub-time').textContent =
+    `${age < 60 ? age + 's ago' : Math.round(age/60) + ' min ago'} · seq #${seq ?? '—'}`;
+}
+
+function setConnection(state) {
+  const dot   = document.getElementById('conn-dot');
+  const label = document.getElementById('conn-label');
+  dot.className = `status-dot ${state === 'live' ? 'live' : state === 'offline' ? 'offline' : 'stale'}`;
+  label.textContent = state === 'live' ? 'Live data' :
+                      state === 'offline' ? 'Offline / no data' : 'Connecting...';
+}
+
+//  Downlink commands 
+async function sendDownlink(command) {
+  const deviceId = document.getElementById('device-id').value.trim();
+  if (!deviceId) { log('Enter a device ID first', 'err'); return; }
+
+  log(`Sending downlink: ${command} → device ${deviceId}...`);
+
+  try {
+    const resp = await fetch(`${API}/downlink`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ device_id: deviceId, command })
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      log(`Downlink sent — messageId: ${data.message_id} payload: 0x${data.payload_hex}`, 'ok');
+    } else {
+      log(`Downlink error: ${data.error}`, 'err');
+    }
+  } catch (err) {
+    log(`Downlink fetch error: ${err.message}`, 'err');
+  }
+}
+
+//  Auto-refresh every 30 s 
+function startAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(refresh, 30000);
+}
+
+//  Init 
+window.addEventListener('DOMContentLoaded', () => {
+  tempChart = makeChart('chart-temp', 'Temperature (°C)', '#185FA5');
+  humChart  = makeChart('chart-hum',  'Humidity (%)',     '#0F6E56');
+  log('Dashboard ready. Enter your device ID and click Refresh.', 'info');
+  startAutoRefresh();
+});
+</script>
+</body>
+</html>

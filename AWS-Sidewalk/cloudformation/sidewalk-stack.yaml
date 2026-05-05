@@ -1,0 +1,754 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Sidewalk Smart Home Stack — nRF54L15 DK project.
+  Deploys: IoT Core rules, Lambda functions, DynamoDB table,
+  IAM roles, SNS topic, API Gateway, S3 dashboard bucket,
+  and CloudWatch alarms.
+
+Parameters:
+  SidewalkDestinationName:
+    Type: String
+    Default: SidewalkSmartHomeDest
+    Description: Name of the IoT Wireless Destination (must already exist or be created separately)
+
+  AlertEmail:
+    Type: String
+    Default: ebrow170@jhu.edu
+    Description: Email address to receive motion and threshold alerts
+
+  TemperatureAlertThresholdC:
+    Type: Number
+    Default: 30
+    Description: Temperature (°C) above which a CloudWatch alarm fires
+
+  MqttUplinkTopic:
+    Type: String
+    Default: sidewalk/home/sensor
+    Description: MQTT topic that IoT Wireless publishes uplink messages to
+
+
+# DynamoDB Table
+Resources:
+
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SidewalkSensorData
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: SidewalkSmartHome
+
+# SNS Topic for alerts
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SidewalkSmartHomeAlerts
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+# IAM Roles
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SidewalkLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SidewalkLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt SensorDataTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - iotwireless:SendDataToWirelessDevice
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SidewalkIoTRuleRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SidewalkIoTRulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt UplinkDecoderLambda.Arn
+                  - !GetAtt MotionAlertLambda.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SidewalkApiRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SidewalkApiPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DashboardApiLambda.Arn
+                  - !GetAtt DownlinkLambda.Arn
+
+# Lambda: Uplink Decoder (IoT Rule → Lambda → DynamoDB)
+
+  UplinkDecoderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SidewalkUplinkDecoder
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SensorDataTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          TEMP_THRESHOLD: !Ref TemperatureAlertThresholdC
+      Code:
+        ZipFile: |
+          import json, boto3, base64, struct, time, os
+
+          ddb   = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+          sns   = boto3.client('sns')
+          TOPIC = os.environ['ALERT_TOPIC_ARN']
+          THRESH = float(os.environ.get('TEMP_THRESHOLD', 30))
+
+          def lambda_handler(event, context):
+              print("Event:", json.dumps(event))
+
+              raw_b64 = event.get('PayloadData', '')
+              if not raw_b64:
+                  print("ERROR: empty PayloadData")
+                  return {'statusCode': 400, 'body': 'empty payload'}
+
+              try:
+                  raw = base64.b64decode(raw_b64)
+              except Exception as e:
+                  print(f"ERROR: base64 decode failed: {e}")
+                  return {'statusCode': 400, 'body': 'bad base64'}
+
+              if len(raw) < 6:
+                  print(f"ERROR: payload too short ({len(raw)} bytes)")
+                  return {'statusCode': 400, 'body': 'payload too short'}
+
+              # Unpack: >hhBB = big-endian int16, int16, uint8, uint8
+              # Matches firmware payload_codec.c encoder
+              temp_raw, hum_raw, flags, seq = struct.unpack('>hhBB', raw[:6])
+
+              temperature_c = round(temp_raw / 10.0, 1)
+              humidity_pct  = round(hum_raw  / 10.0, 1)
+              motion        = bool(flags & 0x01)
+              device_id     = event.get('WirelessDeviceId', 'unknown')
+              ts            = str(int(time.time()))
+
+              # TTL: 30 days from now
+              ttl = int(time.time()) + (30 * 24 * 3600)
+
+              item = {
+                  'device_id':     device_id,
+                  'timestamp':     ts,
+                  'temperature_c': str(temperature_c),
+                  'humidity_pct':  str(humidity_pct),
+                  'motion':        motion,
+                  'seq':           seq,
+                  'flags':         flags,
+                  'raw_payload':   raw_b64,
+                  'ttl':           ttl,
+              }
+
+              ddb.put_item(Item=item)
+              print(f"Stored: device={device_id} temp={temperature_c}°C "
+                    f"hum={humidity_pct}% motion={motion} seq={seq}")
+
+              # High-temperature alert
+              if temperature_c > THRESH:
+                  sns.publish(
+                      TopicArn=TOPIC,
+                      Subject=f"[Sidewalk Alert] High temperature: {temperature_c}°C",
+                      Message=(
+                          f"Device {device_id} reported {temperature_c}°C, "
+                          f"which exceeds the threshold of {THRESH}°C.\n"
+                          f"Humidity: {humidity_pct}%\nTimestamp: {ts}"
+                      )
+                  )
+                  print(f"SNS alert sent: temp {temperature_c}°C > threshold {THRESH}°C")
+
+              return {'statusCode': 200}
+
+  UplinkDecoderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UplinkDecoderLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+
+# Lambda: Motion Alert (separate rule, fires only on motion)
+
+  MotionAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SidewalkMotionAlert
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json, boto3, base64, struct, time, os
+
+          sns   = boto3.client('sns')
+          TOPIC = os.environ['ALERT_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              print("Motion event:", json.dumps(event))
+
+              raw_b64   = event.get('PayloadData', '')
+              device_id = event.get('WirelessDeviceId', 'unknown')
+              ts        = int(time.time())
+
+              # Decode to confirm motion flag is actually set
+              motion = False
+              if raw_b64:
+                  try:
+                      raw = base64.b64decode(raw_b64)
+                      if len(raw) >= 6:
+                          _, _, flags, _ = struct.unpack('>hhBB', raw[:6])
+                          motion = bool(flags & 0x01)
+                  except Exception as e:
+                      print(f"Decode error: {e}")
+
+              if motion:
+                  sns.publish(
+                      TopicArn=TOPIC,
+                      Subject=f"[Sidewalk Alert] Motion detected",
+                      Message=(
+                          f"Motion detected by device {device_id}.\n"
+                          f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(ts))}"
+                      )
+                  )
+                  print(f"Motion alert sent for device {device_id}")
+
+              return {'statusCode': 200}
+
+  MotionAlertPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt MotionAlertLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+
+# Lambda: Dashboard API (GET /readings, GET /latest)
+
+  DashboardApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SidewalkDashboardApi
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SensorDataTable
+      Code:
+        ZipFile: |
+          import json, boto3, os
+          from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
+
+          ddb = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+
+          def cors_headers():
+              return {
+                  'Access-Control-Allow-Origin':  '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'GET,OPTIONS',
+                  'Content-Type': 'application/json',
+              }
+
+          def lambda_handler(event, context):
+              print("API event:", json.dumps(event))
+              method = event.get('httpMethod', 'GET')
+              path   = event.get('path', '/')
+              params = event.get('queryStringParameters') or {}
+
+              if method == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': cors_headers(), 'body': ''}
+
+              device_id = params.get('device_id', 'unknown')
+              limit     = int(params.get('limit', 50))
+              limit     = min(limit, 200)  # cap at 200
+
+              try:
+                  if path.endswith('/latest'):
+                      # Return the single most recent reading
+                      resp = ddb.query(
+                          KeyConditionExpression=Key('device_id').eq(device_id),
+                          ScanIndexForward=False,
+                          Limit=1
+                      )
+                      items = resp.get('Items', [])
+                      body = items[0] if items else {}
+
+                  else:
+                      # Return last N readings in chronological order
+                      resp = ddb.query(
+                          KeyConditionExpression=Key('device_id').eq(device_id),
+                          ScanIndexForward=False,
+                          Limit=limit
+                      )
+                      items = resp.get('Items', [])
+                      items.reverse()  # oldest first for charting
+                      body = items
+
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers(),
+                      'body': json.dumps(body, default=decimal_default)
+                  }
+
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers(),
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  DashboardApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DashboardApiLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+# Lambda: Downlink sender (POST /downlink)
+
+  DownlinkLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SidewalkDownlink
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json, boto3, base64, os
+
+          iotwireless = boto3.client('iotwireless', region_name='us-east-1')
+
+          COMMANDS = {
+              'led_off':    bytes([0x00]),
+              'led_on':     bytes([0x01]),
+              'led_toggle': bytes([0x02]),
+          }
+
+          def cors_headers():
+              return {
+                  'Access-Control-Allow-Origin':  '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS',
+                  'Content-Type': 'application/json',
+              }
+
+          def lambda_handler(event, context):
+              print("Downlink event:", json.dumps(event))
+
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': cors_headers(), 'body': ''}
+
+              try:
+                  body = json.loads(event.get('body', '{}'))
+              except Exception:
+                  return {'statusCode': 400, 'headers': cors_headers(),
+                          'body': json.dumps({'error': 'invalid JSON body'})}
+
+              device_id = body.get('device_id')
+              command   = body.get('command')       # 'led_on' | 'led_off' | 'led_toggle'
+              raw_hex   = body.get('raw_hex')       # optional: custom payload as hex string
+
+              if not device_id:
+                  return {'statusCode': 400, 'headers': cors_headers(),
+                          'body': json.dumps({'error': 'device_id required'})}
+
+              # Determine payload bytes
+              if raw_hex:
+                  try:
+                      payload_bytes = bytes.fromhex(raw_hex)
+                  except ValueError:
+                      return {'statusCode': 400, 'headers': cors_headers(),
+                              'body': json.dumps({'error': 'invalid raw_hex'})}
+              elif command in COMMANDS:
+                  payload_bytes = COMMANDS[command]
+              else:
+                  return {'statusCode': 400, 'headers': cors_headers(),
+                          'body': json.dumps({'error': f'unknown command: {command}. '
+                                              f'Valid: {list(COMMANDS.keys())}'})}
+
+              payload_b64 = base64.b64encode(payload_bytes).decode()
+
+              try:
+                  resp = iotwireless.send_data_to_wireless_device(
+                      Id=device_id,
+                      TransmitMode=0,
+                      PayloadData=payload_b64,
+                      WirelessMetadata={
+                          'Sidewalk': {
+                              'Seq': 1,
+                              'MessageType': 'CUSTOM_COMMAND_ID_NOTIFY',
+                          }
+                      }
+                  )
+                  msg_id = resp.get('MessageId', 'unknown')
+                  print(f"Downlink sent: device={device_id} cmd={command} msgId={msg_id}")
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers(),
+                      'body': json.dumps({'message_id': msg_id, 'command': command,
+                                          'payload_hex': payload_bytes.hex()})
+                  }
+              except Exception as e:
+                  print(f"ERROR sending downlink: {e}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers(),
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  DownlinkPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DownlinkLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+# IoT Core Rules
+
+  UplinkRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: SidewalkUplinkRule
+      TopicRulePayload:
+        Sql: !Sub "SELECT *, timestamp() AS received_at FROM '${MqttUplinkTopic}'"
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt UplinkDecoderLambda.Arn
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: /aws/iot/sidewalk-errors
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+  MotionRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: SidewalkMotionRule
+      TopicRulePayload:
+        # SQL cannot inspect base64 PayloadData directly,
+        # so this rule fires on every message and the Lambda
+        # re-decodes to confirm the motion flag before alerting.
+        Sql: !Sub "SELECT *, timestamp() AS received_at FROM '${MqttUplinkTopic}'"
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt MotionAlertLambda.Arn
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: /aws/iot/sidewalk-errors
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+# API Gateway
+
+  SidewalkApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SidewalkSmartHomeApi
+      Description: REST API for the Sidewalk smart home dashboard and downlink control
+
+  # /readings
+  ReadingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ParentId: !GetAtt SidewalkApi.RootResourceId
+      PathPart: readings
+
+  ReadingsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ResourceId: !Ref ReadingsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations
+          - Arn: !GetAtt DashboardApiLambda.Arn
+
+  ReadingsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ResourceId: !Ref ReadingsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # /latest
+  LatestResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ParentId: !GetAtt SidewalkApi.RootResourceId
+      PathPart: latest
+
+  LatestGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ResourceId: !Ref LatestResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations
+          - Arn: !GetAtt DashboardApiLambda.Arn
+
+  # /downlink
+  DownlinkResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ParentId: !GetAtt SidewalkApi.RootResourceId
+      PathPart: downlink
+
+  DownlinkPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ResourceId: !Ref DownlinkResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations
+          - Arn: !GetAtt DownlinkLambda.Arn
+
+  DownlinkOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      ResourceId: !Ref DownlinkResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ReadingsGet
+      - LatestGet
+      - DownlinkPost
+    Properties:
+      RestApiId: !Ref SidewalkApi
+      StageName: prod
+
+# S3 Dashboard Bucket
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sidewalk-dashboard-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${DashboardBucket}/*
+
+# CloudWatch Alarms
+
+  UplinkErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: SidewalkUplinkErrors
+      AlarmDescription: IoT Rule or Lambda errors on uplink processing
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UplinkDecoderLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+# Outputs
+
+Outputs:
+  DynamoTableName:
+    Description: DynamoDB table storing sensor readings
+    Value: !Ref SensorDataTable
+    Export:
+      Name: SidewalkSensorDataTable
+
+  ApiEndpoint:
+    Description: REST API base URL
+    Value: !Sub https://${SidewalkApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: SidewalkApiEndpoint
+
+  DashboardUrl:
+    Description: S3 static website URL
+    Value: !GetAtt DashboardBucket.WebsiteURL
+    Export:
+      Name: SidewalkDashboardUrl
+
+  AlertTopicArn:
+    Description: SNS topic ARN for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: SidewalkAlertTopic
+
+  UplinkDecoderArn:
+    Description: Uplink decoder Lambda ARN
+    Value: !GetAtt UplinkDecoderLambda.Arn
+
+  DownlinkLambdaArn:
+    Description: Downlink sender Lambda ARN
+    Value: !GetAtt DownlinkLambda.Arn
