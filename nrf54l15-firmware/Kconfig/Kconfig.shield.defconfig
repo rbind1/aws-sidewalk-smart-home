@@ -1,2 +1,0 @@
-osource "C:/ncs/sidewalk-addon/sidewalk/boards/shields/*/Kconfig.defconfig"
-osource "C:/ncs/sidewalk-addon/nrf/boards/shields/*/Kconfig.defconfig"
